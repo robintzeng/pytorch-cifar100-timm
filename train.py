@@ -208,7 +208,11 @@ if __name__ == '__main__':
 
         train(epoch)
         acc = eval_training(epoch)
-
+        if best_acccc < acc:
+            best_acccc = acc
+        print('The best acc is {:0.4f}'.format(best_acccc))
+        print()
+        
         #start to save best performance model after learning rate decay to 0.01
         if epoch > settings.MILESTONES[1] and best_acc < acc:
             torch.save(net.state_dict(), checkpoint_path.format(net=args.net, epoch=epoch, type='best'))
