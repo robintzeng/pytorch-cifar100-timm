@@ -177,7 +177,7 @@ if __name__ == '__main__':
         os.makedirs(checkpoint_path)
     checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}.pth')
 
-    best_acc = 0.0
+    best_acccc = 0.0
     if args.resume:
         best_weights = best_acc_weights(os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder))
         if best_weights:
@@ -212,7 +212,7 @@ if __name__ == '__main__':
             best_acccc = acc
         print('The best acc is {:0.4f}'.format(best_acccc))
         print()
-        
+
         #start to save best performance model after learning rate decay to 0.01
         if epoch > settings.MILESTONES[1] and best_acc < acc:
             torch.save(net.state_dict(), checkpoint_path.format(net=args.net, epoch=epoch, type='best'))
