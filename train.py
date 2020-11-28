@@ -214,10 +214,10 @@ if __name__ == '__main__':
         print()
 
         #start to save best performance model after learning rate decay to 0.01
-        if epoch > settings.MILESTONES[1] and best_acc < acc:
-            torch.save(net.state_dict(), checkpoint_path.format(net=args.net, epoch=epoch, type='best'))
-            best_acc = acc
-            continue
+        # if epoch > settings.MILESTONES[1] and best_acc < acc:
+        #     torch.save(net.state_dict(), checkpoint_path.format(net=args.net, epoch=epoch, type='best'))
+        #     best_acc = acc
+        #     continue
 
         if not epoch % settings.SAVE_EPOCH:
             torch.save(net.state_dict(), checkpoint_path.format(net=args.net, epoch=epoch, type='regular'))
