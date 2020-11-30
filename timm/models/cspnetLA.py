@@ -53,13 +53,12 @@ default_cfgs = {
     'darknet53': _cfg(url=''),
 }
 
-
 model_cfgs = dict(
     LAcspresnet50=dict(
-        stem=dict(out_chs=64, kernel_size=7, stride=2, pool='max'),
+        stem=dict(out_chs=64, kernel_size=3, stride=1, pool='max'),
         stage=dict(
             out_chs=(128, 256, 512, 1024),
-            depth=(2, 2, 4, 1),
+            depth=(3, 3, 5, 2),
             stride=(1,) + (2,) * 3,
             exp_ratio=(2.,) * 4,
             bottle_ratio=(0.5,) * 4,
@@ -130,7 +129,7 @@ model_cfgs = dict(
 
 
 def create_stem(
-        in_chans=3, out_chs=32, kernel_size=3, stride=2, pool='',
+        in_chans=3, out_chs=32, kernel_size=3, stride=1, pool='',
         act_layer=None, norm_layer=None, aa_layer=None):
     stem = nn.Sequential()
     if not isinstance(out_chs, (tuple, list)):
@@ -139,35 +138,37 @@ def create_stem(
     in_c = in_chans
     for i, out_c in enumerate(out_chs):
         conv_name = f'conv{i + 1}'
-        stem.add_module(conv_name, ConvBnAct(
+        stem.add_module(conv_name, AttnConvBnAct(
             in_c, out_c, kernel_size, stride=stride if i == 0 else 1,
             act_layer=act_layer, norm_layer=norm_layer))
         in_c = out_c
         last_conv = conv_name
-    if pool:
-        if aa_layer is not None:
-            stem.add_module('pool', nn.MaxPool2d(kernel_size=3, stride=1, padding=1))
-            stem.add_module('aa', aa_layer(channels=in_c, stride=2))
-        else:
-            stem.add_module('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+    # if pool:
+    #     if aa_layer is not None:
+    #         stem.add_module('pool', nn.MaxPool2d(kernel_size=3, stride=1, padding=1))
+    #         stem.add_module('aa', aa_layer(channels=in_c, stride=2))
+    #     else:
+    #         stem.add_module('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
     return stem, dict(num_chs=in_c, reduction=stride, module='.'.join(['stem', last_conv]))
 
 
-class LABottleneck(nn.Module):
+class LAResBottleneck(nn.Module):
     """ ResNe(X)t Bottleneck Block
     """
 
     def __init__(self, in_chs, out_chs, dilation=1, bottle_ratio=0.25, groups=1,
-                 act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
-                 attn_layer='eca', aa_layer=None, drop_block=None, drop_path=None):
-        super(LABottleneck, self).__init__()
+                 act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d, attn_last=False,
+                 attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
+        super(LAResBottleneck, self).__init__()
         mid_chs = int(round(out_chs * bottle_ratio))
         ckwargs = dict(act_layer=act_layer, norm_layer=norm_layer, aa_layer=aa_layer, drop_block=drop_block)
 
-        self.conv1 = ConvBnAct(in_chs, mid_chs, kernel_size=1, **ckwargs)
-        self.conv2 = ConvBnAct(mid_chs, mid_chs, kernel_size=3, dilation=dilation, groups=groups, **ckwargs)
-        self.conv3 = ConvBnAct(mid_chs, out_chs, kernel_size=1, apply_act=False, **ckwargs)
-        # self.attn = create_attn(attn_layer, channels=out_chs)
+        self.conv1 = AttnConvBnAct(in_chs, mid_chs, kernel_size=1, **ckwargs)
+        self.conv2 = AttnConvBnAct(mid_chs, mid_chs, kernel_size=7, padding=3, groups=8)
+        self.attn2 = create_attn(attn_layer, channels=mid_chs) if not attn_last else None
+        self.conv3 = AttnConvBnAct(mid_chs, out_chs, kernel_size=1, apply_act=False, **ckwargs)
+        self.attn3 = create_attn(attn_layer, channels=out_chs) if attn_last else None
+        self.drop_path = drop_path
         self.act3 = act_layer(inplace=True)
 
     def zero_init_last_bn(self):
@@ -177,8 +178,13 @@ class LABottleneck(nn.Module):
         shortcut = x
         x = self.conv1(x)
         x = self.conv2(x)
+        if self.attn2 is not None:
+            x = self.attn2(x)
         x = self.conv3(x)
-        #x = self.attn(x)
+        if self.attn3 is not None:
+            x = self.attn3(x)
+        if self.drop_path is not None:
+            x = self.drop_path(x)
         x = x + shortcut
         # FIXME partial shortcut needed if first block handled as per original, not used for my current impl
         #x[:, :shortcut.size(1)] += shortcut
@@ -191,7 +197,7 @@ class LACrossStage(nn.Module):
 
     def __init__(self, in_chs, out_chs, stride, dilation, depth, block_ratio=1., bottle_ratio=1., exp_ratio=1.,
                  groups=1, first_dilation=None, down_growth=False, cross_linear=False, block_dpr=None,
-                 block_fn=LABottleneck, **block_kwargs):
+                 block_fn=LAResBottleneck, **block_kwargs):
         super(LACrossStage, self).__init__()
         first_dilation = first_dilation or dilation
         down_chs = out_chs if down_growth else in_chs  # grow downsample channels to output channels
@@ -200,7 +206,7 @@ class LACrossStage(nn.Module):
         conv_kwargs = dict(act_layer=block_kwargs.get('act_layer'), norm_layer=block_kwargs.get('norm_layer'))
 
         if stride != 1 or first_dilation != dilation:
-            self.conv_down = ConvBnAct(
+            self.conv_down = AttnConvBnAct(
                 in_chs, down_chs, kernel_size=3, stride=stride, dilation=first_dilation, groups=groups,
                 aa_layer=block_kwargs.get('aa_layer', None), **conv_kwargs)
             prev_chs = down_chs
@@ -211,7 +217,7 @@ class LACrossStage(nn.Module):
         # FIXME this 1x1 expansion is pushed down into the cross and block paths in the darknet cfgs. Also,
         # there is also special case for the first stage for some of the model that results in uneven split
         # across the two paths. I did it this way for simplicity for now.
-        self.conv_exp = ConvBnAct(prev_chs, exp_chs, kernel_size=1, apply_act=not cross_linear, **conv_kwargs)
+        self.conv_exp = AttnConvBnAct(prev_chs, exp_chs, kernel_size=1, apply_act=not cross_linear, **conv_kwargs)
         prev_chs = exp_chs // 2  # output of conv_exp is always split in two
 
         self.blocks = nn.Sequential()
@@ -222,30 +228,16 @@ class LACrossStage(nn.Module):
             prev_chs = block_out_chs
 
         # transition convs
-        self.conv_transition_b = ConvBnAct(prev_chs, exp_chs // 2, kernel_size=1, **conv_kwargs)
-        self.conv_transition = ConvBnAct(exp_chs, out_chs, kernel_size=1, **conv_kwargs)
+        self.conv_transition_b = AttnConvBnAct(prev_chs, exp_chs // 2, kernel_size=1, **conv_kwargs)
+        self.conv_transition = AttnConvBnAct(exp_chs, out_chs, kernel_size=1, **conv_kwargs)
 
-
-        self.conv1 = AttnConvBnAct(prev_chs, exp_chs // 2, kernel_size=1)
-        self.conv2 = AttnConvBnAct(exp_chs // 2, exp_chs // 2, kernel_size=7, padding=3, groups=8)
-        
-        self.attn = create_attn("eca", channels=out_chs) 
-    
     def forward(self, x):
         if self.conv_down is not None:
             x = self.conv_down(x)
         x = self.conv_exp(x)
         xs, xb = x.chunk(2, dim=1)
         xb = self.blocks(xb)
-
-        xs = self.conv1(xs)
-        xs = self.conv2(xs)
-        
-        
         out = self.conv_transition(torch.cat([xs, self.conv_transition_b(xb)], dim=1))
-        
-        out = self.attn(out)
-
         return out
 
 
@@ -293,7 +285,7 @@ class LACspNet(nn.Module):
 
     def __init__(self, cfg, in_chans=3, num_classes=1000, output_stride=32, global_pool='avg', drop_rate=0.,
                  act_layer=nn.LeakyReLU, norm_layer=nn.BatchNorm2d, aa_layer=None, drop_path_rate=0.,
-                 zero_init_last_bn=True, stage_fn=LACrossStage, block_fn=LABottleneck):
+                 zero_init_last_bn=True, stage_fn=LACrossStage, block_fn=LAResBottleneck):
         super().__init__()
         self.num_classes = num_classes
         self.drop_rate = drop_rate
@@ -355,7 +347,7 @@ class LACspNet(nn.Module):
         return x
 
 
-def _create_lacspnet(variant, pretrained=False, **kwargs):
+def _create_LAcspnet(variant, pretrained=False, **kwargs):
     cfg_variant = variant.split('_')[0]
     return build_model_with_cfg(
         LACspNet, variant, pretrained, default_cfg=default_cfgs[variant],
@@ -364,4 +356,4 @@ def _create_lacspnet(variant, pretrained=False, **kwargs):
 
 @register_model
 def LAcspresnet50(pretrained=False, **kwargs):
-    return _create_lacspnet('LAcspresnet50', pretrained=pretrained, **kwargs)
+    return _create_LAcspnet('LAcspresnet50', pretrained=pretrained, **kwargs)
